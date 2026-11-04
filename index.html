@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pantau darurat lansia</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#F6F7F5; --panel:#FFFFFF; --ink:#1B2A2F; --muted:#5B6B70; --line:#DDE3E1; --alert:#D62839; --ok:#0F766E; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121A1C; --panel:#1A2528; --ink:#EAF0EE; --muted:#9BAAAE; --line:#2B3A3E; --alert:#FF5468; --ok:#4FD1C5; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Atkinson Hyperlegible", system-ui, sans-serif; background: var(--bg); color: var(--ink); display: grid; grid-template-columns: 360px 1fr; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  header { padding: 20px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  #status { font-size: 14px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  #status i { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  #status.on i { background: var(--ok); }
+  #status.err i { background: var(--alert); }
+  #list { overflow-y: auto; flex: 1; padding: 8px; }
+  .item { padding: 14px 12px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+  .item:hover, .item:focus-visible { background: var(--bg); outline: none; border-color: var(--line); }
+  .item.baru { border-color: var(--alert); }
+  .item b { display: block; font-size: 16px; }
+  .item span { font-size: 14px; color: var(--muted); }
+  .item a { color: var(--ok); font-size: 14px; font-weight: 700; }
+  .empty { padding: 24px 12px; color: var(--muted); font-size: 15px; }
+  #map { height: 100%; min-height: 300px; }
+  .pin { width: 22px; height: 22px; border-radius: 50%; background: var(--alert); border: 3px solid #fff; box-shadow: 0 0 0 0 rgba(214,40,57,.6); }
+  .pin.live { animation: ping 1.6s infinite; }
+  .pin.lama { background: #8A9A9E; }
+  @keyframes ping { 70% { box-shadow: 0 0 0 18px rgba(214,40,57,0); } 100% { box-shadow: 0 0 0 0 rgba(214,40,57,0); } }
+  @media (prefers-reduced-motion: reduce) { .pin.live { animation: none; } }
+  @media (max-width: 760px) { body { grid-template-columns: 1fr; grid-template-rows: 45% 55%; } aside { order: 2; border-right: 0; border-top: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<aside>
+  <header>
+    <h1>Pantau darurat lansia</h1>
+    <div id="status"><i></i><span>Menghubungkan…</span></div>
+  </header>
+  <div id="list"><div class="empty">Belum ada panggilan darurat. Tekan tombol pada perangkat untuk menguji.</div></div>
+</aside>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// ====== ISI BAGIAN INI (sama dengan DB_URL di kode ESP32) ======
+const DB_URL = "https://console.firebase.google.com/project/tekno-9fee0/database/tekno-9fee0-default-rtdb/data/~2F?hl=id";
+const INTERVAL_MS = 3000;
+// ===============================================================
+
+const map = L.map("map").setView([-7.9797, 112.6304], 12);
+L.tileLayer("https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png?key=cb1_51bl_1_a691f5de496f4bf47738a54b", { subdomains: "abcd", maxZoom: 19, attribution: "&copy; OpenStreetMap, &copy; CARTO" }).addTo(map);
+
+const markers = {};
+let known = new Set(), first = true, audioCtx;
+
+function icon(cls) { return L.divIcon({ className: "", html: `<div class="pin ${cls}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] }); }
+function waktu(ts) { return new Date(ts).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "medium" }); }
+function setStatus(cls, teks) { const s = document.getElementById("status"); s.className = cls; s.querySelector("span").textContent = teks; }
+
+function bunyi() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.25, 0.5].forEach(t => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
+      g.gain.value = 0.2; o.start(audioCtx.currentTime + t); o.stop(audioCtx.currentTime + t + 0.15);
+    });
+  } catch (e) {}
+}
+
+function render(alerts) {
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  if (!alerts.length) { list.innerHTML = '<div class="empty">Belum ada panggilan darurat.</div>'; return; }
+  alerts.forEach((a, i) => {
+    const el = document.createElement("div");
+    el.className = "item" + (i === 0 ? " baru" : "");
+    el.tabIndex = 0;
+    const gmaps = `https://www.google.com/maps?q=${a.lat},${a.lng}`;
+    el.innerHTML = `<b>${a.device}${a.fix ? "" : " (lokasi terakhir)"}</b><span>${waktu(a.ts)}</span><br><span>${a.lat.toFixed(5)}, ${a.lng.toFixed(5)}</span> <a href="${gmaps}" target="_blank" rel="noopener">Buka di Google Maps</a>`;
+    const fokus = () => { map.setView([a.lat, a.lng], 17); markers[a.id].openPopup(); };
+    el.addEventListener("click", e => { if (e.target.tagName !== "A") fokus(); });
+    el.addEventListener("keydown", e => { if (e.key === "Enter") fokus(); });
+    list.appendChild(el);
+  });
+}
+
+async function ambil() {
+  try {
+    const r = await fetch(`${DB_URL}/alerts.json?orderBy="$key"&limitToLast=20`);
+    if (!r.ok) throw new Error(r.status);
+    const data = (await r.json()) || {};
+    const alerts = Object.entries(data).map(([id, v]) => ({ id, ...v })).filter(a => typeof a.lat === "number").sort((a, b) => b.ts - a.ts);
+
+    alerts.forEach((a, i) => {
+      if (!markers[a.id]) {
+        markers[a.id] = L.marker([a.lat, a.lng], { icon: icon(i === 0 ? "live" : "lama") }).addTo(map).bindPopup(`<b>${a.device}</b><br>${waktu(a.ts)}`);
+      }
+    });
+    Object.entries(markers).forEach(([id, m]) => m.setIcon(icon(id === (alerts[0] || {}).id ? "live" : "lama")));
+
+    const baru = alerts.filter(a => !known.has(a.id));
+    if (baru.length && !first) { map.setView([baru[0].lat, baru[0].lng], 17); markers[baru[0].id].openPopup(); bunyi(); }
+    else if (first && alerts.length) { map.setView([alerts[0].lat, alerts[0].lng], 15); }
+    alerts.forEach(a => known.add(a.id));
+    first = false;
+
+    render(alerts);
+    setStatus("on", "Terhubung · diperbarui " + new Date().toLocaleTimeString("id-ID"));
+  } catch (e) {
+    setStatus("err", "Gagal mengambil data. Periksa DB_URL dan aturan database.");
+  }
+}
+ambil();
+setInterval(ambil, INTERVAL_MS);
+document.addEventListener("click", () => { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); }, { once: true });
+</script>
+</body>
+</html>
